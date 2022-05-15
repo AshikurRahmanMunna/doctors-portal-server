@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const app = express();
+const jwt = require("jsonwebtoken");
 require("dotenv").config();
 const port = process.env.PORT || 5000;
 
@@ -19,6 +20,27 @@ const client = new MongoClient(uri, {
   serverApi: ServerApiVersion.v1,
 });
 
+function verifyJWT(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) {
+    return res.status(401).send({ message: "Unauthorized Access" });
+  } else {
+    const accessToken = authHeader.split(" ")[1];
+    jwt.verify(
+      accessToken,
+      process.env.ACCESS_TOKEN_SECRET,
+      (error, decoded) => {
+        if (error) {
+          return res.status(403).send({ message: "Forbidden" });
+        } else {
+          req.decoded = decoded;
+          next();
+        }
+      }
+    );
+  }
+}
+
 async function run() {
   try {
     await client.connect();
@@ -29,6 +51,7 @@ async function run() {
     const bookingCollection = client
       .db("doctors_portal")
       .collection("bookings");
+    const userCollection = client.db("doctors_portal").collection("users");
 
     // API naming convention
     app.get("/service", async (req, res) => {
@@ -37,40 +60,76 @@ async function run() {
       res.send(services);
     });
 
-    app.get('/booking', async (req, res) => {
+    app.put("/user/:email", async (req, res) => {
+      const email = req.params.email;
+      const user = req.body;
+      const filter = { email: email };
+      const options = { upsert: true };
+      const updatedDoc = {
+        $set: user,
+      };
+      const result = await userCollection.updateOne(
+        filter,
+        updatedDoc,
+        options
+      );
+      const token = jwt.sign(
+        { email: email },
+        process.env.ACCESS_TOKEN_SECRET,
+        {
+          expiresIn: "1h",
+        }
+      );
+      res.send({ result, token });
+    });
+
+    app.get("/booking", verifyJWT, async (req, res) => {
       const patient = req.query.patient;
-      const bookings = await bookingCollection.find({patient: patient}).toArray();
-      res.send(bookings); 
-    })
-    app.post('/booking', async(req, res) => {
+      const decodedEmail = req.decoded.email;
+      if (patient === decodedEmail) {
+        const bookings = await bookingCollection
+          .find({ patient: patient })
+          .toArray();
+        res.send(bookings);
+      } else {
+        return res.status(403).send("Forbidden Access");
+      }
+    });
+    app.post("/booking", async (req, res) => {
       const booking = req.body;
-      const query = {treatment: booking.treatment, date: booking.date, patient: booking.patient}
+      const query = {
+        treatment: booking.treatment,
+        date: booking.date,
+        patient: booking.patient,
+      };
       const exists = await bookingCollection.findOne(query);
-      if(exists) {
-        return res.send({success: false, booking: exists})
+      if (exists) {
+        return res.send({ success: false, booking: exists });
       }
       const result = await bookingCollection.insertOne(booking);
-      res.send({success: true, result});
-    })
+      res.send({ success: true, result });
+    });
     // warning
     // This is not the proper way to query
     // After learning more about mongodb. Use aggregate lookup, pipeline, match, group
-    app.get('/available', async(req, res) => {
-      const date = req.query.date || 'May 14, 2022';
+    app.get("/available", async (req, res) => {
+      const date = req.query.date || "May 14, 2022";
       // 1. get all services
       const services = await serviceCollection.find({}).toArray();
       // get the bookings of that day
-      const query = {date: date};
+      const query = { date: date };
       const bookings = await bookingCollection.find(query).toArray();
       // 3. For each service, find booking for that service
-      services.forEach(service => {
-        const serviceBookings = bookings.filter(b => b.treatment === service.name);
-        const bookedSlots = serviceBookings.map(book => book.slot);
-        const available = service.slots.filter(s => !bookedSlots.includes(s));
+      services.forEach((service) => {
+        const serviceBookings = bookings.filter(
+          (b) => b.treatment === service.name
+        );
+        const bookedSlots = serviceBookings.map((book) => book.slot);
+        const available = service.slots.filter((s) => !bookedSlots.includes(s));
         service.slots = available;
-      })
+      });
       res.send(services);
-    })
+    });
   } finally {
     // await client.close()
   }
