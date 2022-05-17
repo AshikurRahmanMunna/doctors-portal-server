@@ -55,7 +55,7 @@ async function run() {
 
     // API naming convention
     app.get("/service", async (req, res) => {
-      const cursor = serviceCollection.find({});
+      const cursor = serviceCollection.find({}).project({name: 1});
       const services = await cursor.toArray();
       res.send(services);
     });
