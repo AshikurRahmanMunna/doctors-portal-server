@@ -3,8 +3,9 @@ const cors = require("cors");
 const app = express();
 const jwt = require("jsonwebtoken");
 require("dotenv").config();
-const mandrillTransport = require("nodemailer-mandrill-transport");
+const sgTransport = require("nodemailer-sendgrid-transport");
 const nodemailer = require("nodemailer");
+const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 
 const port = process.env.PORT || 5000;
 
@@ -47,37 +48,72 @@ function verifyJWT(req, res, next) {
 
 const emailSenderOptions = {
   auth: {
-    apiKey: process.env.EMAIL_SENDER_KEY,
-  }
+    api_key: process.env.EMAIL_SENDER_KEY,
+  },
 };
-const transport = nodemailer.createTransport(
-  mandrillTransport(emailSenderOptions)
-);
+
+const emailClient = nodemailer.createTransport(sgTransport(emailSenderOptions));
 
 function sendAppointmentEmail(booking) {
-  const { patientName, patient, treatment, slot, date } = booking;
-  const emailTemplate = {
+  const { patient, patientName, treatment, date, slot } = booking;
+
+  var email = {
     from: process.env.EMAIL_SENDER,
     to: patient,
-    subject: `Your Appointment For ${treatment} is on ${date} at ${slot} s confirmed`,
-    text: `Your Appointment For ${treatment} is on ${date} at ${slot} s confirmed`,
+    subject: `Your Appointment for ${treatment} is on ${date} at ${slot} is Confirmed`,
+    text: `Your Appointment for ${treatment} is on ${date} at ${slot} is Confirmed`,
     html: `
       <div>
-        <h1>Hello ${patientName},</h1>
-        <h3>Your Appointment for ${treatment} is confirmed.</h3>
-        <p>Thank You for taking appointment from us. Our Doctors are good. So you dont have to worry about treatment. Our ${treatment} service is better than other hospitals ${treatment} service.</p>
-        <p>Looking Forward To Seeing You on ${date}</p>
-        <h4>Our Address</h4>
-        <p>DSCC 158/24, North Rayerbag, Jatrabari, Dhaka.</p>
-        <a href="https://mailchimp.com/help/about-domain-purchasing/">Unsubscribe</a>
+        <p> Hello ${patientName}, </p>
+        <h3>Your Appointment for ${treatment} is confirmed</h3>
+        <p>Looking forward to seeing you on ${date} at ${slot}.</p>
+        
+        <h3>Our Address</h3>
+        <p>Andor Killa Bandorban</p>
+        <p>Bangladesh</p>
+        <a href="https://web.programming-hero.com/">unsubscribe</a>
       </div>
     `,
   };
-  transport.sendMail(emailTemplate, function(err, info) {
+
+  emailClient.sendMail(email, function (err, info) {
     if (err) {
-      console.error(err);
+      console.log(err);
     } else {
-      console.log('Message sent', info);
+      console.log("Message sent: ", info);
+    }
+  });
+}
+function sendPaymentConfirmEmail(booking, transactionId) {
+  const { patient, patientName, treatment, date, slot } = booking;
+
+  var email = {
+    from: process.env.EMAIL_SENDER,
+    to: patient,
+    subject: `We have received your payment for ${treatment} is on ${date} at ${slot} is confirmed.`,
+    text: `Your payment for ${treatment} is on ${date} at ${slot} is Confirmed`,
+    html: `
+      <div>
+        <p> Hello ${patientName}, </p>
+        <h3>Your Appointment for your payment.</h3>
+        <p>We have received your payment</p>
+        <p>Looking forward to seeing you on ${date} at ${slot}.</p>
+
+        <h3>TransactionId: ${transactionId}</h3>
+        
+        <h3>Our Address</h3>
+        <p>Andor Killa Bandorban</p>
+        <p>Bangladesh</p>
+        <a href="https://web.programming-hero.com/">unsubscribe</a>
+      </div>
+    `,
+  };
+
+  emailClient.sendMail(email, function (err, info) {
+    if (err) {
+      console.log(err);
+    } else {
+      console.log("Message sent: ", info);
     }
   });
 }
@@ -94,6 +130,9 @@ async function run() {
       .collection("bookings");
     const userCollection = client.db("doctors_portal").collection("users");
     const doctorCollection = client.db("doctors_portal").collection("doctors");
+    const paymentCollection = client
+      .db("doctors_portal")
+      .collection("payments");
 
     const verifyAdmin = async (req, res, next) => {
       const requester = req.decoded.email;
@@ -107,6 +146,38 @@ async function run() {
       }
     };
 
+    app.post("/create-payment-intent", verifyJWT, async (req, res) => {
+      const service = req.body;
+      const price = service.price;
+      const amount = price * 100;
+      const paymentIntent = await stripe.paymentIntents.create({
+        amount: amount,
+        currency: "usd",
+        payment_method_types: ["card"],
+      });
+      res.send({ clientSecret: paymentIntent.client_secret });
+    });
+
+    app.patch("/booking/:id", verifyJWT, async (req, res) => {
+      const id = req.params.id;
+      const payment = req.body;
+      const filter = { _id: ObjectId(id) };
+      const updateDoc = {
+        $set: {
+          paid: true,
+          transactionId: payment.transactionId,
+        },
+      };
+      const result = await paymentCollection.insertOne(payment);
+      const updatedBooking = await bookingCollection.updateOne(
+        filter,
+        updateDoc
+      );
+      const booking = await bookingCollection.findOne(filter);
+      sendPaymentConfirmEmail(booking, payment.transactionId);
+      res.send({ updatedBooking, result });
+    });
+
     // API naming convention
     app.get("/service", async (req, res) => {
       const cursor = serviceCollection.find({}).project({ name: 1 });
@@ -118,12 +189,14 @@ async function run() {
       const user = await userCollection.find({}).toArray();
       res.send(user);
     });
+
     app.get("/admin/:email", async (req, res) => {
       const email = req.params.email;
       const user = await userCollection.findOne({ email: email });
       const isAdmin = user.role === "admin";
       res.send({ admin: isAdmin });
     });
+
     app.put("/user/admin/:email", verifyJWT, verifyAdmin, async (req, res) => {
       const email = req.params.email;
       const filter = { email: email };
@@ -169,6 +242,13 @@ async function run() {
         return res.status(403).send("Forbidden Access");
       }
     });
+
+    app.get("/booking/:id", verifyJWT, async (req, res) => {
+      const id = req.params.id;
+      const booking = await bookingCollection.findOne({ _id: ObjectId(id) });
+      res.send(booking);
+    });
+
     app.post("/booking", async (req, res) => {
       const booking = req.body;
       const query = {
